@@ -1,0 +1,17 @@
+name: Auto Approve Sellvia Orders Cron
+
+on:
+  schedule:
+    # Runs automatically on the hour
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping-auto-approve:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Sellvia Auto-Approve Endpoint
+        run: |
+          curl -X POST "https://jesse-autopilot-bridge.onrender.com/api/sellvia/auto-approve" \
+            -H "Authorization: Bearer ${{ secrets.ADMIN_TOKEN }}" \
+            -H "Content-Type: application/json"
