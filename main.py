@@ -1,119 +1,99 @@
 import os
-import requests
 import stripe
 from fastapi import FastAPI, Request, HTTPException, Header
-from fastapi.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
 
-# Initialize FastAPI App
+# Initialize FastAPI app
 app = FastAPI(title="Jesse Autopilot Bridge")
 
-# Cross-Origin Resource Sharing (CORS) Middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Load Secret Environment Variables
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
-SHOPIFY_ADMIN_TOKEN = os.getenv("SHOPIFY_ADMIN_ACCESS_TOKEN")
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+# ------------------------------------------------------------------------------
+# 1. Environment Variables & Stripe Setup
+# ------------------------------------------------------------------------------
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+SELLVIA_WEBHOOK_SECRET = os.getenv("SELLVIA_WEBHOOK_SECRET")
+SELLVIA_MASTER_KEY = os.getenv("SELLVIA_MASTER_KEY")
+MONGODB_URI = os.getenv("MONGODB_URI")
 
-# Configure Stripe API
-stripe.api_key = STRIPE_SECRET_KEY
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
+# ------------------------------------------------------------------------------
+# 2. Asynchronous MongoDB Client (Motor)
+# ------------------------------------------------------------------------------
+# Fallback to local or None if MONGODB_URI is not set during initial builds
+db = None
+if MONGODB_URI:
+    client = AsyncIOMotorClient(MONGODB_URI)
+    db = client["autopilot_store"]  # Main database instance
 
-# ----------------------------------------------------
-# HELPER / BUSINESS LOGIC FUNCTIONS
-# ----------------------------------------------------
-def process_sellvia_fulfillment(order_data: dict) -> bool:
-    """
-    Core automation logic for sending paid Shopify orders to Sellvia.
-    """
-    order_id = order_data.get("id")
-    line_items = order_data.get("line_items", [])
-    
-    print(f"[SELLVIA AUTOMATION] Processing Order ID: {order_id} with {len(line_items)} item(s).")
-    
-    # Sellvia integration requests go here
-    # e.g., requests.post("https://api.sellvia.com/v1/orders", json=...)
-    
-    return True
-
-
-# ----------------------------------------------------
-# API ENDPOINTS
-# ----------------------------------------------------
-
-# 1. Healthcheck Route
+# ------------------------------------------------------------------------------
+# 3. Healthcheck Endpoint
+# ------------------------------------------------------------------------------
 @app.get("/")
-def read_root():
+async def root():
     return {
-        "status": "online",
-        "system": "Jesse Autopilot FastAPI Bridge",
-        "version": "1.0.0"
+        "status": "healthy",
+        "service": "jesse-autopilot-bridge",
+        "mongodb_connected": db is not None
     }
 
-
-# 2. Shopify Order Webhook Endpoint
-@app.post("/api/shopify/webhook/order-created")
-async def shopify_order_webhook(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    order_id = payload.get("id")
-    if not order_id:
-        raise HTTPException(status_code=400, detail="Order ID missing from payload")
-
-    # Run Sellvia fulfillment execution logic
-    success = process_sellvia_fulfillment(payload)
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to initiate Sellvia fulfillment")
-
-    return {
-        "status": "success",
-        "order_id": order_id,
-        "action": "sent_to_sellvia"
-    }
-
-
-# 3. Sellvia Auto-Approval / Cron Job Endpoint (GitHub Actions)
-@app.post("/api/sellvia/auto-approve")
-def auto_approve(authorization: str = Header(None)):
-    if not authorization or authorization != f"Bearer {ADMIN_TOKEN}":
-        raise HTTPException(status_code=401, detail="Unauthorized request access token")
-
-    print("[AUTOPILOT] Executing scheduled batch order auto-approval.")
-    
-    return {
-        "status": "success",
-        "message": "All pending Sellvia payout & fulfillment batches processed"
-    }
-
-
-# 4. Stripe Webhook Endpoint
-@app.post("/api/stripe/webhook")
-async def stripe_webhook(request: Request):
+# ------------------------------------------------------------------------------
+# 4. Stripe Webhook Endpoint (With Async MongoDB Logging)
+# ------------------------------------------------------------------------------
+@app.post("/webhook")
+async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
     payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
 
-    try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid Stripe signature header")
+    # Validate Stripe Signature if secret is present
+    if STRIPE_WEBHOOK_SECRET:
+        try:
+            event = stripe.Webhook.construct_event(
+                payload, stripe_signature, STRIPE_WEBHOOK_SECRET
+            )
+        except (ValueError, stripe.error.SignatureVerificationError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    else:
+        # Fallback to raw JSON reading if secret verification is skipped in dev
+        event = await request.json()
 
-    # Handle Stripe payment events
-    if event["type"] == "payment_intent.succeeded":
-        payment_intent = event["data"]["object"]
-        print(f"[STRIPE] Payment Succeeded: {payment_intent['id']}")
+    # Log incoming webhook payload directly into MongoDB
+    if db is not None:
+        await db["stripe_events"].insert_one({
+            "event_type": event.get("type"),
+            "event_id": event.get("id"),
+            "data": event,
+            "status": "received"
+        })
+
+    # Business Logic for Completed Orders
+    event_type = event.get("type")
+    if event_type == "checkout.session.completed":
+        session = event.get("data", {}).get("object", {})
+        
+        # Save customer order specifically into 'orders' collection
+        if db is not None:
+            await db["orders"].insert_one({
+                "checkout_session_id": session.get("id"),
+                "customer_email": session.get("customer_details", {}).get("email"),
+                "amount_total": session.get("amount_total"),
+                "currency": session.get("currency"),
+                "payment_status": session.get("payment_status"),
+                "shipping_details": session.get("shipping_details")
+            })
+
+    return {"status": "success"}
+
+# ------------------------------------------------------------------------------
+# 5. Sellvia Webhook Endpoint (For Status / Order Updates)
+# ------------------------------------------------------------------------------
+@app.post("/sellvia-webhook")
+async def sellvia_webhook(request: Request):
+    payload = await request.json()
+
+    # Log Sellvia tracking and fulfillment updates to MongoDB
+    if db is not None:
+        await db["sellvia_events"].insert_one({
+            "payload": payload,
+            "type": payload.get("event") or "status_update"
+        })
 
     return {"status": "success"}
