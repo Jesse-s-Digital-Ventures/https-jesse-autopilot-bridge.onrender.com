@@ -1,0 +1,15 @@
+services:
+  # 1. FastAPI Webhook Server (main.py)
+  - type: web
+    name: jesse-autopilot-bridge
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+  # 2. Daily Social Poster Cron Job (auto_social_poster.py)
+  - type: cron
+    name: social-media-cron
+    env: python
+    schedule: "0 12 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python auto_social_poster.py
