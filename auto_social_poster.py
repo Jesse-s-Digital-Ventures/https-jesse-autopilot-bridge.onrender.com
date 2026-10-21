@@ -1,235 +1,235 @@
 import os
-import re
 import time
 import requests
-import feedparser
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from openai import OpenAI
 import anthropic
 
-# ==============================================================================
-# CONFIGURATION & API KEYS
-# ==============================================================================
-STORE_RSS_URL = "https://wonderfulgemspoint.shop/collections/all.atom"
-
-# AI Clients
+# -------------------------------------------------------------------
+# 1. Configuration & Credentials
+# -------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-
-# Meta / Facebook & Instagram Graph API
-META_ACCESS_TOKEN = os.getenv("META_PAGE_ACCESS_TOKEN")
+META_PAGE_ACCESS_TOKEN = os.getenv("META_PAGE_ACCESS_TOKEN")
 FACEBOOK_PAGE_ID = os.getenv("FACEBOOK_PAGE_ID")
 INSTAGRAM_ACCOUNT_ID = os.getenv("INSTAGRAM_ACCOUNT_ID")
-
-# TikTok Content Posting API
 TIKTOK_ACCESS_TOKEN = os.getenv("TIKTOK_ACCESS_TOKEN")
 
-# Initialize AI SDKs
+STORE_RSS_URL = os.getenv(
+    "STORE_RSS_URL", 
+    "https://wonderfulgemspoint.shop/collections/all.atom"
+)
+
+# Initialize AI Clients
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-# ==============================================================================
-# 1. FETCH PRODUCTS FROM RSS FEED (LAST 24 HOURS)
-# ==============================================================================
-def get_recent_products(feed_url: str, hours: int = 24) -> list:
-    """Parses the Shopify Atom RSS feed for products added/updated in the past 24h."""
-    feed = feedparser.parse(feed_url)
-    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
-    recent_products = []
 
-    for entry in feed.entries:
-        # Parse published/updated date
-        pub_tuple = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
-        if not pub_tuple:
-            continue
-        
-        pub_datetime = datetime(*pub_tuple[:6], tzinfo=timezone.utc)
-        
-        if pub_datetime >= cutoff_time:
-            # Extract image URL from HTML summary if available
-            image_match = re.search(r'src="(https://[^"]+)"', entry.summary)
-            image_url = image_match.group(1) if image_match else None
+# -------------------------------------------------------------------
+# 2. RSS Feed Parser (Past 24 Hours)
+# -------------------------------------------------------------------
+def fetch_recent_products(feed_url):
+    print(f"[INFO] Fetching product feed from {feed_url}...")
+    try:
+        response = requests.get(feed_url, timeout=15)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"[ERROR] Failed to download RSS feed: {e}")
+        return []
 
-            # Clean raw summary HTML to plain text
-            clean_summary = re.sub(r'<[^>]+>', '', entry.summary).strip()
+    products = []
+    now = datetime.now(timezone.utc)
+    cutoff_time = now - timedelta(days=1)
 
-            recent_products.append({
-                "title": entry.title,
-                "link": entry.link,
-                "summary": clean_summary[:500],
-                "image_url": image_url,
-                "published_at": pub_datetime.isoformat()
-            })
+    try:
+        root = ET.fromstring(response.content)
+        # Atom feeds (Shopify default format) use the standard Atom namespace
+        ns = {'atom': 'http://www.w3.org/2005/Atom'}
 
-    return recent_products
+        for entry in root.findall('atom:entry', ns):
+            pub_elem = entry.find('atom:published', ns)
+            if pub_elem is None or not pub_elem.text:
+                continue
 
-# ==============================================================================
-# 2. AI COPY GENERATION (OPENAI / CLAUDE)
-# ==============================================================================
-def generate_copy_openai(product: dict) -> dict:
-    """Generates tailored captions for FB, IG, and TikTok using OpenAI (GPT-4o)."""
-    prompt = f"""
-    You are an e-commerce social media manager for 'Wonderful Gems Point'.
-    Write tailored social media captions for this product:
-    
-    Title: {product['title']}
-    Description: {product['summary']}
-    Product Link: {product['link']}
+            published_dt = datetime.fromisoformat(pub_elem.text.replace('Z', '+00:00'))
 
-    Return strictly a JSON-like formatted response with three fields:
-    - INSTAGRAM: An aesthetic caption with 5 niche hashtags and a call-to-action.
-    - FACEBOOK: A friendly, engaging post highlighting benefits with the link.
-    - TIKTOK: A catchy 1-2 sentence viral video/carousel hook script.
-    """
-    
-    response = openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
+            if published_dt >= cutoff_time:
+                title = entry.find('atom:title', ns).text
+                link_elem = entry.find('atom:link', ns)
+                link = link_elem.attrib.get('href') if link_elem is not None else ""
+
+                # Extract product image URL from HTML summary block
+                summary_elem = entry.find('atom:summary', ns)
+                image_url = None
+                if summary_elem is not None and summary_elem.text and 'src="' in summary_elem.text:
+                    image_url = summary_elem.text.split('src="')[1].split('"')[0]
+
+                products.append({
+                    'title': title,
+                    'link': link,
+                    'image_url': image_url,
+                    'published': published_dt
+                })
+
+    except Exception as e:
+        print(f"[ERROR] XML Feed Parsing Error: {e}")
+
+    print(f"[INFO] Discovered {len(products)} new product(s) published in the past 24 hours.")
+    return products
+
+
+# -------------------------------------------------------------------
+# 3. AI Copy Generation (OpenAI & Anthropic Claude)
+# -------------------------------------------------------------------
+def generate_captions(product_title, product_link):
+    """Generates promotional copy using OpenAI and Claude."""
+    prompt = (
+        f"Write an engaging, high-converting social media caption for product: '{product_title}'. "
+        f"Brand: Wonderful Gems Point. Include 3-5 relevant hashtags and CTA link: {product_link}. "
+        "Keep it concise, stylish, and engaging."
     )
-    content = response.choices[0].message.content
-    return parse_ai_response(content)
 
-def generate_copy_claude(product: dict) -> dict:
-    """Alternative copy generator using Anthropic Claude (Claude 3.5 Sonnet)."""
-    response = anthropic_client.messages.create(
-        model="claude-3-5-sonnet-20241022",
-        max_tokens=1000,
-        messages=[{
-            "role": "user",
-            "content": f"Write captions for FB, IG, and TikTok for this item:\nTitle: {product['title']}\nLink: {product['link']}"
-        }]
-    )
-    return {"FACEBOOK": response.content[0].text, "INSTAGRAM": "", "TIKTOK": ""}
+    # A. OpenAI Generation
+    openai_caption = None
+    if openai_client:
+        try:
+            res = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200
+            )
+            openai_caption = res.choices[0].message.content.strip()
+            print("[SUCCESS] Generated caption using OpenAI.")
+        except Exception as e:
+            print(f"[ERROR] OpenAI generation error: {e}")
 
-def parse_ai_response(text: str) -> dict:
-    """Helper parser to split captions per platform."""
-    return {
-        "instagram": text,  # Can refine with regex/json schema matching
-        "facebook": text,
-        "tiktok": text
-    }
+    # B. Claude (Anthropic) Generation
+    claude_caption = None
+    if anthropic_client:
+        try:
+            res = anthropic_client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=200,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            claude_caption = res.content[0].text.strip()
+            print("[SUCCESS] Generated caption using Claude.")
+        except Exception as e:
+            print(f"[ERROR] Claude generation error: {e}")
 
-# ==============================================================================
-# 3. PUBLISHING API MODULES
-# ==============================================================================
-def post_to_facebook(image_url: str, caption: str) -> bool:
-    """Publishes a photo post to a Facebook Page via Graph API."""
-    if not META_ACCESS_TOKEN or not FACEBOOK_PAGE_ID:
-        print("[FB] Missing Meta Credentials. Skipping Facebook upload.")
-        return False
+    # Fallback default if API calls are skipped/failed
+    default_caption = f"Check out our new item: {product_title}! Shop now: {product_link} #WonderfulGemsPoint #Jewelry"
+    
+    # Return selected versions for platforms (combining or assigning as desired)
+    meta_caption = openai_caption or default_caption
+    tiktok_caption = claude_caption or openai_caption or default_caption
 
-    url = f"https://graph.facebook.com/v20.0/{FACEBOOK_PAGE_ID}/photos"
-    payload = {
-        "url": image_url,
-        "message": caption,
-        "access_token": META_ACCESS_TOKEN
-    }
+    return meta_caption, tiktok_caption
+
+
+# -------------------------------------------------------------------
+# 4. Social Media Direct Posting Endpoints
+# -------------------------------------------------------------------
+def post_to_facebook(page_id, token, caption, image_url):
+    if not page_id or not token:
+        print("[SKIP] Facebook credentials missing.")
+        return
+
+    url = f"https://graph.facebook.com/v19.0/{page_id}/photos"
+    payload = {'message': caption, 'url': image_url, 'access_token': token}
     res = requests.post(url, data=payload)
-    if res.status_code == 200:
-        print(f"[FB] Success! Post ID: {res.json().get('id')}")
-        return True
-    print(f"[FB] Error: {res.text}")
-    return False
-
-def post_to_instagram(image_url: str, caption: str) -> bool:
-    """Publishes a photo post to an Instagram Business account via Graph API."""
-    if not META_ACCESS_TOKEN or not INSTAGRAM_ACCOUNT_ID:
-        print("[IG] Missing Meta Credentials. Skipping Instagram upload.")
-        return False
-
-    # Step A: Create Media Container
-    container_url = f"https://graph.facebook.com/v20.0/{INSTAGRAM_ACCOUNT_ID}/media"
-    container_payload = {
-        "image_url": image_url,
-        "caption": caption,
-        "access_token": META_ACCESS_TOKEN
-    }
-    res = requests.post(container_url, data=container_payload)
-    if res.status_code != 200:
-        print(f"[IG] Container Creation Failed: {res.text}")
-        return False
     
-    creation_id = res.json().get("id")
+    if res.status_code == 200:
+        print(f"[SUCCESS] Posted to Facebook Page! ID: {res.json().get('id')}")
+    else:
+        print(f"[ERROR] Facebook publishing failed: {res.text}")
 
-    # Step B: Publish Media Container
-    time.sleep(5)  # Wait for IG image processing
-    publish_url = f"https://graph.facebook.com/v20.0/{INSTAGRAM_ACCOUNT_ID}/media_publish"
-    publish_payload = {
-        "creation_id": creation_id,
-        "access_token": META_ACCESS_TOKEN
-    }
-    pub_res = requests.post(publish_url, data=publish_payload)
+
+def post_to_instagram(ig_id, token, caption, image_url):
+    if not ig_id or not token or not image_url:
+        print("[SKIP] Instagram credentials or image missing.")
+        return
+
+    # Container Creation Phase
+    create_url = f"https://graph.facebook.com/v19.0/{ig_id}/media"
+    create_payload = {'image_url': image_url, 'caption': caption, 'access_token': token}
+    res = requests.post(create_url, data=create_payload)
+    
+    if res.status_code != 200:
+        print(f"[ERROR] Instagram Container creation failed: {res.text}")
+        return
+
+    creation_id = res.json().get('id')
+    time.sleep(5)  # Wait for media container status check
+
+    # Media Publish Phase
+    pub_url = f"https://graph.facebook.com/v19.0/{ig_id}/media_publish"
+    pub_payload = {'creation_id': creation_id, 'access_token': token}
+    pub_res = requests.post(pub_url, data=pub_payload)
+    
     if pub_res.status_code == 200:
-        print(f"[IG] Success! Published ID: {pub_res.json().get('id')}")
-        return True
-    print(f"[IG] Publishing Error: {pub_res.text}")
-    return False
+        print(f"[SUCCESS] Posted to Instagram! Media ID: {pub_res.json().get('id')}")
+    else:
+        print(f"[ERROR] Instagram publishing failed: {pub_res.text}")
 
-def post_to_tiktok(image_url: str, caption: str) -> bool:
-    """Publishes a photo post to TikTok using the Direct Post Content API."""
-    if not TIKTOK_ACCESS_TOKEN:
-        print("[TikTok] Missing Token. Skipping TikTok upload.")
-        return False
+
+def post_to_tiktok(token, caption, image_url):
+    if not token or not image_url:
+        print("[SKIP] TikTok token or image missing.")
+        return
 
     url = "https://open.tiktokapis.com/v2/post/publish/content/init/"
     headers = {
-        "Authorization": f"Bearer {TIKTOK_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json; charset=UTF-8'
     }
     payload = {
         "post_info": {
-            "title": caption[:150],  # TikTok title character limit
+            "title": caption,
             "privacy_level": "PUBLIC_TO_EVERYONE",
-            "disable_comment": False,
+            "disable_comment": False
         },
         "source_info": {
             "source": "PULL_FROM_URL",
             "photo_cover_index": 1,
             "photo_images": [image_url]
         },
-        "post_mode": "MEDIA_UPLOAD",
+        "post_mode": "DIRECT_POST",
         "media_type": "PHOTO"
     }
+
     res = requests.post(url, json=payload, headers=headers)
     if res.status_code == 200:
-        print("[TikTok] Photo post successfully initiated!")
-        return True
-    print(f"[TikTok] Error: {res.text}")
-    return False
+        print(f"[SUCCESS] Posted photo to TikTok! Share ID: {res.json().get('data', {}).get('publish_id')}")
+    else:
+        print(f"[ERROR] TikTok publishing failed: {res.text}")
 
-# ==============================================================================
-# MAIN EXECUTION FLOW
-# ==============================================================================
+
+# -------------------------------------------------------------------
+# 5. Main Execution Flow
+# -------------------------------------------------------------------
 def main():
-    print("--- Checking Feed for Past 24h Products ---")
-    products = get_recent_products(STORE_RSS_URL, hours=24)
-    
+    print("=== Launching Daily Social Media Cron Job ===")
+    products = fetch_recent_products(STORE_RSS_URL)
+
     if not products:
-        print("No new products published in the past day.")
+        print("[INFO] No new items posted in the past 24 hours. Exiting process.")
         return
 
-    print(f"Found {len(products)} new product(s) to publish.\n")
+    for item in products:
+        print(f"\n--- Processing Product: {item['title']} ---")
+        meta_caption, tiktok_caption = generate_captions(item['title'], item['link'])
+        image_url = item['image_url']
 
-    for prod in products:
-        print(f"Processing: {prod['title']}")
+        # Publish content across active endpoints
+        post_to_facebook(FACEBOOK_PAGE_ID, META_PAGE_ACCESS_TOKEN, meta_caption, image_url)
+        post_to_instagram(INSTAGRAM_ACCOUNT_ID, META_PAGE_ACCESS_TOKEN, meta_caption, image_url)
+        post_to_tiktok(TIKTOK_ACCESS_TOKEN, tiktok_caption, image_url)
 
-        # 1. Generate Copy via AI
-        if openai_client:
-            copy = generate_copy_openai(prod)
-        elif anthropic_client:
-            copy = generate_copy_claude(prod)
-        else:
-            print("No AI credentials found. Using fallback RSS copy.")
-            copy = {"facebook": prod["summary"], "instagram": prod["summary"], "tiktok": prod["title"]}
+    print("\n=== Cron Execution Finished ===")
 
-        # 2. Publish Across Social Accounts
-        if prod["image_url"]:
-            post_to_facebook(prod["image_url"], copy["facebook"])
-            post_to_instagram(prod["image_url"], copy["instagram"])
-            post_to_tiktok(prod["image_url"], copy["tiktok"])
-        else:
-            print("Skipping media posts: Product entry lacks an image URL.")
 
 if __name__ == "__main__":
     main()
+
