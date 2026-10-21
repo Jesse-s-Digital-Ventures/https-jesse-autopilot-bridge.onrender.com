@@ -4,26 +4,36 @@ import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from openai import OpenAI
-import anthropic
+
+# Try importing anthropic; handle case if package is loaded without key
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
 
 # -------------------------------------------------------------------
-# 1. Configuration & Credentials
+# 1. Configuration & Environment Variables
 # -------------------------------------------------------------------
+# Currently Active Variables in Render
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-META_PAGE_ACCESS_TOKEN = os.getenv("META_PAGE_ACCESS_TOKEN")
 FACEBOOK_PAGE_ID = os.getenv("FACEBOOK_PAGE_ID")
 INSTAGRAM_ACCOUNT_ID = os.getenv("INSTAGRAM_ACCOUNT_ID")
-TIKTOK_ACCESS_TOKEN = os.getenv("TIKTOK_ACCESS_TOKEN")
-
 STORE_RSS_URL = os.getenv(
     "STORE_RSS_URL", 
     "https://wonderfulgemspoint.shop/collections/all.atom"
 )
 
+# Pending Variables (Will gracefully skip until populated in Render)
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+META_PAGE_ACCESS_TOKEN = os.getenv("META_PAGE_ACCESS_TOKEN")
+TIKTOK_ACCESS_TOKEN = os.getenv("TIKTOK_ACCESS_TOKEN")
+
 # Initialize AI Clients
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+
+anthropic_client = None
+if ANTHROPIC_API_KEY and anthropic:
+    anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
 # -------------------------------------------------------------------
@@ -44,7 +54,7 @@ def fetch_recent_products(feed_url):
 
     try:
         root = ET.fromstring(response.content)
-        # Atom feeds (Shopify default format) use the standard Atom namespace
+        # Atom feed namespace standard for Shopify feeds
         ns = {'atom': 'http://www.w3.org/2005/Atom'}
 
         for entry in root.findall('atom:entry', ns):
@@ -55,11 +65,13 @@ def fetch_recent_products(feed_url):
             published_dt = datetime.fromisoformat(pub_elem.text.replace('Z', '+00:00'))
 
             if published_dt >= cutoff_time:
-                title = entry.find('atom:title', ns).text
+                title_elem = entry.find('atom:title', ns)
+                title = title_elem.text if title_elem is not None else "New Product"
+                
                 link_elem = entry.find('atom:link', ns)
                 link = link_elem.attrib.get('href') if link_elem is not None else ""
 
-                # Extract product image URL from HTML summary block
+                # Extract image URL embedded in Atom HTML summary block
                 summary_elem = entry.find('atom:summary', ns)
                 image_url = None
                 if summary_elem is not None and summary_elem.text and 'src="' in summary_elem.text:
@@ -80,17 +92,16 @@ def fetch_recent_products(feed_url):
 
 
 # -------------------------------------------------------------------
-# 3. AI Copy Generation (OpenAI & Anthropic Claude)
+# 3. AI Caption Generation (OpenAI Primary with Claude Backup)
 # -------------------------------------------------------------------
 def generate_captions(product_title, product_link):
-    """Generates promotional copy using OpenAI and Claude."""
+    """Generates captions using OpenAI and Anthropic Claude if available."""
     prompt = (
         f"Write an engaging, high-converting social media caption for product: '{product_title}'. "
         f"Brand: Wonderful Gems Point. Include 3-5 relevant hashtags and CTA link: {product_link}. "
         "Keep it concise, stylish, and engaging."
     )
 
-    # A. OpenAI Generation
     openai_caption = None
     if openai_client:
         try:
@@ -104,7 +115,6 @@ def generate_captions(product_title, product_link):
         except Exception as e:
             print(f"[ERROR] OpenAI generation error: {e}")
 
-    # B. Claude (Anthropic) Generation
     claude_caption = None
     if anthropic_client:
         try:
@@ -118,11 +128,9 @@ def generate_captions(product_title, product_link):
         except Exception as e:
             print(f"[ERROR] Claude generation error: {e}")
 
-    # Fallback default if API calls are skipped/failed
     default_caption = f"Check out our new item: {product_title}! Shop now: {product_link} #WonderfulGemsPoint #Jewelry"
     
-    # Return selected versions for platforms (combining or assigning as desired)
-    meta_caption = openai_caption or default_caption
+    meta_caption = openai_caption or claude_caption or default_caption
     tiktok_caption = claude_caption or openai_caption or default_caption
 
     return meta_caption, tiktok_caption
@@ -133,7 +141,7 @@ def generate_captions(product_title, product_link):
 # -------------------------------------------------------------------
 def post_to_facebook(page_id, token, caption, image_url):
     if not page_id or not token:
-        print("[SKIP] Facebook credentials missing.")
+        print("[SKIP] Facebook Page ID or Access Token missing. Skipping Facebook post.")
         return
 
     url = f"https://graph.facebook.com/v19.0/{page_id}/photos"
@@ -141,14 +149,14 @@ def post_to_facebook(page_id, token, caption, image_url):
     res = requests.post(url, data=payload)
     
     if res.status_code == 200:
-        print(f"[SUCCESS] Posted to Facebook Page! ID: {res.json().get('id')}")
+        print(f"[SUCCESS] Posted to Facebook Page! Photo ID: {res.json().get('id')}")
     else:
         print(f"[ERROR] Facebook publishing failed: {res.text}")
 
 
 def post_to_instagram(ig_id, token, caption, image_url):
     if not ig_id or not token or not image_url:
-        print("[SKIP] Instagram credentials or image missing.")
+        print("[SKIP] Instagram Account ID, Access Token, or image missing. Skipping Instagram post.")
         return
 
     # Container Creation Phase
@@ -161,7 +169,7 @@ def post_to_instagram(ig_id, token, caption, image_url):
         return
 
     creation_id = res.json().get('id')
-    time.sleep(5)  # Wait for media container status check
+    time.sleep(5)  # Pause brief moment for Meta media processing
 
     # Media Publish Phase
     pub_url = f"https://graph.facebook.com/v19.0/{ig_id}/media_publish"
@@ -176,7 +184,7 @@ def post_to_instagram(ig_id, token, caption, image_url):
 
 def post_to_tiktok(token, caption, image_url):
     if not token or not image_url:
-        print("[SKIP] TikTok token or image missing.")
+        print("[SKIP] TikTok Access Token or image missing. Skipping TikTok post.")
         return
 
     url = "https://open.tiktokapis.com/v2/post/publish/content/init/"
@@ -214,7 +222,7 @@ def main():
     products = fetch_recent_products(STORE_RSS_URL)
 
     if not products:
-        print("[INFO] No new items posted in the past 24 hours. Exiting process.")
+        print("[INFO] No new items published in the past 24 hours. Exiting process.")
         return
 
     for item in products:
@@ -222,7 +230,7 @@ def main():
         meta_caption, tiktok_caption = generate_captions(item['title'], item['link'])
         image_url = item['image_url']
 
-        # Publish content across active endpoints
+        # Publish content across target platforms
         post_to_facebook(FACEBOOK_PAGE_ID, META_PAGE_ACCESS_TOKEN, meta_caption, image_url)
         post_to_instagram(INSTAGRAM_ACCOUNT_ID, META_PAGE_ACCESS_TOKEN, meta_caption, image_url)
         post_to_tiktok(TIKTOK_ACCESS_TOKEN, tiktok_caption, image_url)
@@ -232,4 +240,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
