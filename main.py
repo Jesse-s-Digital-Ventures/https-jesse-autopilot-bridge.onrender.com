@@ -1,6 +1,6 @@
 import os
 import feedparser
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from motor.motor_asyncio import AsyncIOMotorClient
 from openai import AsyncOpenAI
 import anthropic
@@ -11,13 +11,22 @@ app = FastAPI(
     version="1.0.0",
 )
 
-#
+# ------------------------------------------------------------------------------
+# Wise Webhook & Root Health Endpoints
+# ------------------------------------------------------------------------------
 @app.get("/")
 def health():
     return {"message": "Jesse Autopilot Bridge Active"}
 
 @app.post("/api/wise/webhook")
-def wise_webhook():
+async def wise_webhook(request: Request):
+    try:
+        data = await request.json()
+        print("Wise Webhook Received:", data)
+    except Exception as e:
+        print("Wise Webhook ping received (empty or non-JSON body)")
+    
+    # Return 200 OK immediately so Wise verification succeeds
     return {"status": "success", "received": True}
  ------------------------------------------------------------------------------
 # Environment Variables
