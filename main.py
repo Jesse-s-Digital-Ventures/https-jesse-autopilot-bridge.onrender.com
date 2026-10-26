@@ -4,18 +4,20 @@ from fastapi import FastAPI, HTTPException, Request, status
 from motor.motor_asyncio import AsyncIOMotorClient
 from openai import AsyncOpenAI
 import anthropic
+
 app = FastAPI(
     title="Jesse-Autopilot-Bridge",
     description="Automated social marketing bridge for Wonderful Gems",
     version="1.0.0",
 )
-#
-------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
 # Wise Webhook & Root Health Endpoints
 # ------------------------------------------------------------------------------
 @app.get("/")
 def health():
     return {"message": "Jesse Autopilot Bridge Active"}
+
 @app.post("/api/wise/webhook")
 async def wise_webhook(request: Request):
     try:
@@ -23,9 +25,9 @@ async def wise_webhook(request: Request):
         print("Wise Webhook Received:", data)
     except Exception as e:
         print("Wise Webhook ping received (empty or non-JSON body)")
-   
-    # Return 200 OK immediately so Wise verification succeeds
-    return {"status": "success", "received": True} ------------------------------------------------------------------------------
+    return {"status": "success", "received": True}
+
+# ------------------------------------------------------------------------------
 # Environment Variables
 # ------------------------------------------------------------------------------
 MONGODB_URI = os.getenv("MONGODB_URI", "")
@@ -47,7 +49,7 @@ if MONGODB_URI:
 
 # ------------------------------------------------------------------------------
 # Health Check Endpoint
-#------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 @app.get("/healthz", status_code=status.HTTP_200_OK)
 async def health_check():
     mongo_status = False
@@ -63,9 +65,10 @@ async def health_check():
         "service": "jesse-autopilot-bridge",
         "mongodb_connected": mongo_status,
     }
+
 # ------------------------------------------------------------------------------
 # Auto-Posting Trigger Route
-#------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 @app.post("/cron/rss-post", status_code=status.HTTP_200_OK)
 async def trigger_rss_post():
     # 1. Fetch products from Sellvia RSS feed
@@ -83,6 +86,7 @@ async def trigger_rss_post():
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch RSS feed: {str(err)}"
         )
+
     # 2. Generate marketing copy with OpenAI / Claude
     caption = ""
     if ANTHROPIC_API_KEY:
