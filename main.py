@@ -11,7 +11,15 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# ------------------------------------------------------------------------------
+#
+@app.get("/")
+def health():
+    return {"message": "Jesse Autopilot Bridge Active"}
+
+@app.post("/api/wise/webhook")
+def wise_webhook():
+    return {"status": "success", "received": True}
+ ------------------------------------------------------------------------------
 # Environment Variables
 # ------------------------------------------------------------------------------
 MONGODB_URI = os.getenv("MONGODB_URI", "")
